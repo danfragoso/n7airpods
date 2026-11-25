@@ -1,0 +1,217 @@
+diff --git a/sdk/hb_lv_surface.c b/sdk/hb_lv_surface.c
+index 2df9c89..c7a7d27 100644
+--- a/sdk/hb_lv_surface.c
++++ b/sdk/hb_lv_surface.c
+@@ -38,9 +38,30 @@ static uint32_t tick_cb(void)
+  * when s_draw == s_fb it's an in-place alpha-fixup. */
+ static unsigned int *s_draw;   /* LVGL draw buffer base (GPU pixel buffer pixels or s_fb) */
+ 
++/* HB_LV_BACKBUF (opt-in per app): render into a private, CACHED back buffer instead of straight into the
++ * display framebuffer, and let the flush copy only the dirty rectangles out. LVGL's software renderer
++ * reads and writes every pixel it blends; on the framebuffer (not cached) each of those is a slow bus
++ * access, on ordinary heap memory they hit the cache. The cost moves to one write-only copy per dirty
++ * rectangle, which the flush already does. The measured full-page refresh of the AirPods page was
++ * about 100 ms rendering in place. `hb_lv_first_refresh_us` records the first full refresh for the app to log. */
++#ifdef HB_LV_BACKBUF
++#define HB_BACKBUF_PIXELS (240 * 432)
++static unsigned int s_back[HB_BACKBUF_PIXELS] __attribute__((aligned(32)));
++#endif
++unsigned int hb_lv_first_refresh_us;
++
+ /* ---- flush (DIRECT mode) ---- */
++#ifdef HB_LV_BACKBUF
++/* Passive counters the app may log: time spent copying dirty rectangles out to the display, and how many
++ * pixels that was (so the trace can tell rendering from copying). Two timer reads per flush. */
++unsigned int hb_lv_flush_us, hb_lv_flush_px, hb_lv_flush_n;
++#endif
++
+ static void flush_cb(lv_display_t *d, const lv_area_t *area, unsigned char *px)
+ {
++#ifdef HB_LV_BACKBUF
++    unsigned int t0 = HWTIMER_CNTL;
++#endif
+     unsigned int *src = s_draw;
+     unsigned int *dst = (unsigned int *)lv_display_get_user_data(d);   /* s_fb */
+     int fw = lv_display_get_horizontal_resolution(d);
+@@ -51,6 +72,11 @@ static void flush_cb(lv_display_t *d, const lv_area_t *area, unsigned char *px)
+         unsigned int *o = dst + y * fw + x1;
+         for (x = 0; x < aw; x++) o[x] = s[x] | 0xff000000u;
+     }
++#ifdef HB_LV_BACKBUF
++    hb_lv_flush_us += HWTIMER_CNTL - t0;
++    hb_lv_flush_px += (unsigned int)(aw * (y2 - y1 + 1));
++    hb_lv_flush_n++;
++#endif
+     lv_display_flush_ready(d);
+ }
+ 
+@@ -130,6 +156,41 @@ void lv_surface_frame(void)
+    Exposed so an app's frame cb can target it with hardware 2D (hb_compositor). */
+ static void *s_fb;
+ static int   s_fbw, s_fbh;
++
++#ifdef HB_LV_BACKBUF
++/* hb_lv_present565 (HB_LV_BACKBUF apps): put a window of a ready-made RGB565 picture on the display
++ * directly, without LVGL's renderer. `pic` is the picture (row stride `stride` bytes, `pic_h` rows); the
++ * display shows rows sy .. sy+height-1. LVGL's generic RGB565 -> XRGB8888 image blend costs ~190 ns per
++ * pixel on the device (three multiplies and three byte stores per pixel), a full screen of it ~19 ms; this
++ * reads two pixels per word and writes whole words, so the cost is about that of writing display memory.
++ * The caller must keep LVGL from drawing meanwhile (lv_display_enable_invalidation(disp, false)) and
++ * invalidate the screen when it hands the display back. */
++/* RGB565 -> XRGB8888 with the SAME rounding as LVGL's own blend ((r5 * 2106) >> 8, (g6 * 1037) >> 8), through
++ * three small tables, so a presented frame and a frame LVGL draws from the same picture agree to the pixel. */
++static unsigned int s_pr[32], s_pg[64], s_pb5[32];
++static int s_ptab;
++void hb_lv_present565(const void *pic, int stride, int pic_h, int sy)
++{
++    int fw = s_fbw, fh = s_fbh, y, x;
++    if (!s_fb || !pic || (fw & 1) || (stride & 3)) return;
++    if (!s_ptab) {
++        for (x = 0; x < 32; x++) { s_pr[x] = (unsigned int)((x * 2106) >> 8) << 16; s_pb5[x] = (unsigned int)((x * 2106) >> 8); }
++        for (x = 0; x < 64; x++) s_pg[x] = (unsigned int)((x * 1037) >> 8) << 8;
++        s_ptab = 1;
++    }
++    if (sy + fh > pic_h) sy = pic_h - fh;
++    if (sy < 0) return;
++    for (y = 0; y < fh; y++) {
++        const unsigned int *src = (const unsigned int *)((const unsigned char *)pic + (unsigned)(sy + y) * (unsigned)stride);
++        unsigned int *o = (unsigned int *)s_fb + (unsigned)y * (unsigned)fw;
++        for (x = 0; x < fw / 2; x++) {
++            unsigned int two = src[x], a = two & 0xffffu, b = two >> 16;
++            o[2 * x]     = 0xff000000u | s_pr[a >> 11] | s_pg[(a >> 5) & 63u] | s_pb5[a & 31u];
++            o[2 * x + 1] = 0xff000000u | s_pr[b >> 11] | s_pg[(b >> 5) & 63u] | s_pb5[b & 31u];
++        }
++    }
++}
++#endif
+ #ifdef HB_LV_COMPOSITOR
+ static void *s_pb;   /* GPU pixel buffer handle backing s_draw */
+ #endif
+@@ -148,6 +209,9 @@ static void lv_surface_setup(void *fb, int w, int h)
+        compositor-addressable GPU pixel buffer (the hardware unit can target it; the flush
+        copies it out to s_fb). Fall back to direct-into-fb if allocation fails. */
+     s_draw = (unsigned int *)fb;
++#ifdef HB_LV_BACKBUF
++    if ((unsigned)(w * h) <= (unsigned)HB_BACKBUF_PIXELS) s_draw = s_back;
++#endif
+ #ifdef HB_LV_COMPOSITOR
+     {
+         /* Cached: the compositor draw unit clean+invalidates each filled region (svc#70),
+@@ -190,7 +254,11 @@ static void lv_surface_setup(void *fb, int w, int h)
+     lv_indev_set_scroll_limit(indev, 10);
+ 
+     lv_app_main();          /* the app builds its UI */
+-    lv_refr_now(s_disp);
++    {
++        unsigned int t0 = HWTIMER_CNTL;
++        lv_refr_now(s_disp);
++        hb_lv_first_refresh_us = HWTIMER_CNTL - t0;
++    }
+ }
+ 
+ /* Entry point. The resident calls entry(0, fb, w, h, shared) on EVERY launch; we set up
+diff --git a/sdk/hb_shared.h b/sdk/hb_shared.h
+index c38ceba..6385123 100644
+--- a/sdk/hb_shared.h
++++ b/sdk/hb_shared.h
+@@ -51,6 +51,10 @@ typedef struct hb_shared {
+     int (*prepare_unload)(void);
+     /* Appended (version unchanged): multi-finger snapshot, see hb_touch_snap_t. */
+     hb_touch_snap_t touch_snap;
++    /* Appended, self-identifying extension; old apps ignore it. The AAP app
++     * must validate magic, ABI and size before accessing resident-owned state. */
++    uint32_t aap_magic;
++    void *aap_state;
+ } hb_shared_t;
+ 
+ /* Set by the image's entry (resident: its own block; app: the entry argument). */
+diff --git a/system/silver_resident/Makefile b/system/silver_resident/Makefile
+index 6d33d12..95c30d8 100644
+--- a/system/silver_resident/Makefile
++++ b/system/silver_resident/Makefile
+@@ -4,7 +4,7 @@
+ # (trampolines, vtable copies, trace ring, shared app state) is part of that
+ # block; the stub zeroes it before calling payload_entry.
+ APP_NAME := silver_resident
+-SRCS     := silver_resident.c bluetooth_fix.c dock_fix.c ../../sdk/hb_app_catalog.c
++SRCS     := silver_resident.c bluetooth_fix.c dock_fix.c btlog.c did_spoof.c aap_transport.c aap_le.c aes128.c ../../sdk/hb_app_catalog.c
+ RELOC    := 1
+ EXTRA_CFLAGS += -DHB_RAWMSG_TRACE
+ include ../../sdk/hb_app.mk
+diff --git a/system/silver_resident/compat_fixes.h b/system/silver_resident/compat_fixes.h
+index 6c6b174..3fe3073 100644
+--- a/system/silver_resident/compat_fixes.h
++++ b/system/silver_resident/compat_fixes.h
+@@ -1,8 +1,32 @@
+ #ifndef NANO_COMPAT_FIXES_H
+ #define NANO_COMPAT_FIXES_H
+ 
++#include <stdint.h>
++
+ /* 0 = stock bytes did not match; 1 = applied; 2 = already applied. */
+ int hb_bluetooth_fix(void);
+ int hb_dock_fix(void);
+ 
++/* btlog.c: Bluetooth flight recorder. 0 installed, 1 opted out (/Apps/Data/btlog.off),
++ * 2 vtable slot mismatch, 3 no memory, 4 already installed. Observation only. */
++int btlog_install(void);
++unsigned int btlog_block(void);
++/* A mark from our own code on the recorder's timeline (no-op until the recorder is installed). */
++void btl_mark(const char *tag, uint32_t a, uint32_t b);
++
++/* did_spoof.c: the Device-ID record the stack registers (vendor 0x004C, source Bluetooth SIG, like LibrePods'
++ * "VendorID spoofing"). 0 patched, 1 stock bytes did not match, 2 logging only (default; /Apps/Data/did.on enables). */
++int did_spoof_install(void);
++unsigned did_spoof_calls(void);
++
++/* aap_transport.c: the resident owns the AAP L2CAP channel. */
++void hb_aap_init(void);
++int hb_aap_poll(void);
++
++/* aap_le.c: LE advertisement listener and scan control (state is hb_aap_state_t). */
++void aap_le_attach(void *state);
++void aap_le_poll(void);
++void aap_le_set_key(const unsigned char *key16);
++void aap_le_on_adv(unsigned dev, unsigned type, const volatile unsigned char *rpt);
++
+ #endif
+diff --git a/system/silver_resident/silver_resident.c b/system/silver_resident/silver_resident.c
+index d78da4c..02bb29e 100644
+--- a/system/silver_resident/silver_resident.c
++++ b/system/silver_resident/silver_resident.c
+@@ -1461,6 +1461,11 @@ static int rawmsg_hook(void *self, void *msg)
+ __attribute__((section(".text.hook"), used, noinline))
+ static int action_hook(void *self, const char *name, void *msg)
+ {
++    /* AAP channel upkeep: this dispatch hook is the context where opening the
++     * channel is known safe (the app's own heap context killed the device).
++     * No-op unless the user asked (Connect) and an AVDTP link exists. */
++    hb_aap_poll();
++
+     /* (2) Once per boot: build every forwarding trampoline (in our .bss) from
+      * the verified 39A10023 stock prologue, then point the firmware entry at our
+      * hook. Always from the stock bytes, so a firmware entry a previous boot
+@@ -1473,6 +1478,15 @@ static int action_hook(void *self, const char *name, void *msg)
+         hb_trace_log("DOCKFIX ", (uint32_t)dock_fix, 0);
+         hb_boot_report(0x154u, (uint32_t)bt_fix);
+         hb_boot_report(0x158u, (uint32_t)dock_fix);
++        {   /* BT flight recorder (btlog.c): observation only; /Apps/Data/btlog.off disables */
++            int btl = btlog_install();
++            hb_trace_log("BTLOG   ", (uint32_t)btl, btlog_block());
++            hb_boot_report(0x14cu, btlog_block());   /* free word: launch log ends at 0x14c */
++        }
++        {   /* Device-ID record: Apple's Bluetooth-SIG vendor id (did_spoof.c); /Apps/Data/did.on enables (off by default) */
++            int did = did_spoof_install();
++            hb_trace_log("DIFIX   ", (uint32_t)did, 0);
++        }
+         hb_silver_patch_function_stock(ADDR_GETRESOURCE, (void *)&getres_hook,
+                                        s_getres_tramp,
+                                        GETRES_STOCK, sizeof GETRES_STOCK);
+@@ -1619,6 +1633,7 @@ void payload_entry(void *image_base, uint32_t image_span, uint32_t resident_vers
+     s_shared.trace   = hb_trace_log;
+     s_shared.screenshot_mode = 1;      /* default Screenshot; the app sets mode 0/1/2 */
+     hb_shared = &s_shared;
++    hb_aap_init();
+ 
+     /* Find the previous boot's ring (DRAM survives a panic reboot) before our
+      * own ring is stamped; action_hook writes the copy to disk. */
