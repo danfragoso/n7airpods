@@ -1,0 +1,15 @@
+# local work, never committed
+.nanoapps/
+.nanoapps-stock/
+build/
+tooling/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Apple firmware and what is derived from it (research/tools work on a local copy)
+*.ipsw
+*.MSE
+*.mse
+*.img
+osos.bin
